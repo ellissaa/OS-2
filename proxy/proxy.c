@@ -51,7 +51,7 @@ proxy_t *proxyCreate(cacheStorage_t *cache, threadPool_t *threadpool) {
         return NULL;
     }
 
-    proxy->servSocket = createServSocket();
+    proxy->servSocket = createServSocket(); // принимаем подключения от клиентов
     if (proxy->servSocket == -1) {
         free(proxy);
         return NULL;
@@ -77,8 +77,8 @@ int proxyStart(proxy_t *proxy) {
     loggerInfo("Proxy started");
 
     proxy->running = 1;
-    while (proxy->running) {
-        int clientSocket = accept(proxy->servSocket, NULL, NULL);
+    while (proxy->running) {                                        // бесконечно обрабатываем запросы от клиентов
+        int clientSocket = accept(proxy->servSocket, NULL, NULL);   // сокет, связанный с новым клиентом
         if (clientSocket < 0) {
             loggerError("Error accepting connection: %s", strerror(errno));
             continue;

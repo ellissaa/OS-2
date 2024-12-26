@@ -37,6 +37,13 @@ int main(int argc, char **argv) {
         abort();
     }
 
+    act.sa_handler = SIG_IGN;
+    err = sigaction(SIGPIPE, &act, NULL);
+    if (err) {
+        loggerCritical("Failed to setup SIGPIPE handler, error: %s", strerror(errno));
+        abort();
+    }
+
     cacheStorage_t *cache = cacheStorageCreate();
     if (!cache) {
         loggerCritical("Failed to create cache storage");

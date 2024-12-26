@@ -12,9 +12,9 @@
 typedef struct phr_header phrHeader_t;
 
 typedef struct {
-    const char *method;
-    const char *path;
-    phrHeader_t headers[MAX_NUM_HEADERS];
+    const char *method;                     
+    const char *path;                       // URL
+    phrHeader_t headers[MAX_NUM_HEADERS];   // служебная информация
     size_t methodLen;
     size_t pathLen;
     size_t numHeaders;

@@ -4,7 +4,7 @@
 #include "cache-entry.h"
 #include "log/logger.h"
 
-#define CHUNK_SIZE          1024
+#define CHUNK_SIZE          (1024 * 8)
 
 cacheEntry_t *cacheEntryCreate() { // создание записи в кэше
     cacheEntry_t *entry = calloc(1, sizeof(*entry));

@@ -28,7 +28,7 @@ static int sendFromCache(int sock, cacheEntry_t *cache);
 static ssize_t readAndParseRequest(int sock, char *buf, size_t maxLen, reqParse_t *parseData);
 static ssize_t handleResponse(int sockToServ, int sockToClient, char *req, cacheStorage_t *cacheStorage, int *status);
 
-void handleClient(void *args) {
+void handleClient(void *args) { // полностью работаем с клиентом - получаем запрос, отправляем ответ
     int sockToClient = ((clientHandlerArgs_t*) args)->sockToClient;
     cacheStorage_t *cacheStorage = ((clientHandlerArgs_t*) args)->cache;
     free(args);
@@ -37,10 +37,10 @@ void handleClient(void *args) {
     char request[MAX_REQ_SIZE + 1] = {0};
     cacheEntry_t *cacheEntry = NULL;
     ssize_t reqLen, respLen;
-    reqParse_t reqParse;
+    reqParse_t reqParse; 
     int err;
 
-    err = setTimeout(sockToClient, TIMEOUT);
+    err = setTimeout(sockToClient, TIMEOUT); // таймаут на ожидание ответа от клиента
     if (err) {
         loggerError("Failed to set timeout for client, error: %s", strerror(errno));
         disconnect(sockToClient);
@@ -227,10 +227,10 @@ static int sendFromCache(int sock, cacheEntry_t *cache) {
     size_t lenToSend;
     int err, ret;
 
-    pthread_mutex_lock(&cache->mutex);
+    pthread_mutex_lock(&cache->mutex); // чтобы не было race condition за запись в кэше, 1 читает, 1 пишет
 
     while (1) {
-        while (cache->size == sentTotal && !cache->completed && !cache->canceled) {
+        while (cache->size == sentTotal && !cache->completed && !cache->canceled) { // делаем wait до момента, пока не придут/не обновятся данные
             pthread_cond_wait(&cache->updated, &cache->mutex);
         }
 
