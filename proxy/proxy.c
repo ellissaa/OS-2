@@ -20,9 +20,6 @@ static int createServSocket() {
         return -1;
     }
 
-    int true = 1;
-    setsockopt(servSocket, SOL_SOCKET, SO_REUSEADDR, &true, sizeof(true));
-
     struct sockaddr_in sAddr;
     memset(&sAddr, 0, sizeof(sAddr));
     sAddr.sin_family = AF_INET;
@@ -68,6 +65,7 @@ void proxyDestroy(proxy_t *proxy) {
     close(proxy->servSocket);
     proxy->running = 0;
     free(proxy);
+    clientHandlerFinalize();
 }
 
 int proxyStart(proxy_t *proxy) {
@@ -99,5 +97,6 @@ int proxyStart(proxy_t *proxy) {
         threadPoolSubmit(proxy->threadpool, handleClient, args);
     }
 
+    clientHandlerInit();
     return 0;
 }

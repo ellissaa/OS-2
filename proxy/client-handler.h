@@ -12,9 +12,9 @@
 typedef struct phr_header phrHeader_t;
 
 typedef struct {
-    const char *method;                     
+    const char *method;
     const char *path;                       // URL
-    phrHeader_t headers[MAX_NUM_HEADERS];   // служебная информация
+    phrHeader_t headers[MAX_NUM_HEADERS]; 
     size_t methodLen;
     size_t pathLen;
     size_t numHeaders;
@@ -35,6 +35,9 @@ typedef struct {
     cacheStorage_t *cache;
 } clientHandlerArgs_t;
 
+void clientHandlerInit();
+void clientHandlerFinalize();
+
 void handleClient(void *args);
 
-#endif
+#endif /* CACHE_PROXY_CLIENT_HANDLER */

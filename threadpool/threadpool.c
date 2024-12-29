@@ -56,7 +56,7 @@ void threadPoolSubmit(threadPool_t *pool, void (*run) (void *), void *arg) {
 
     if (pool->stopped) {
         pthread_mutex_unlock(&pool->mutex);
-        return;
+        return; 
     }
 
     // добавили таск

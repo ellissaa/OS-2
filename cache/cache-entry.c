@@ -9,7 +9,7 @@
 cacheEntry_t *cacheEntryCreate() { // создание записи в кэше
     cacheEntry_t *entry = calloc(1, sizeof(*entry));
     if (!entry) return NULL;
-
+    entry->refCount = 1;
     pthread_mutex_init(&entry->mutex, NULL);
     pthread_cond_init(&entry->updated, NULL);
     pthread_spin_init(&entry->refCountLock, 0);

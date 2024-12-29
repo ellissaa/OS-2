@@ -14,6 +14,8 @@
 #include "client-handler.h"
 #include "log/logger.h"
 
+static pthread_mutex_t searchCreateMutex; // для решения проблемы конкурентного доступа при создании/чтении записи в кэше
+
 static int strEq(const char *s1, const char *s2, size_t len);
 static int setTimeout(int sock, unsigned int ms);
 static void disconnect(int sock);
@@ -26,9 +28,17 @@ static int sendData(int sock, const char *data, size_t len);
 static int sendFromCache(int sock, cacheEntry_t *cache);
 
 static ssize_t readAndParseRequest(int sock, char *buf, size_t maxLen, reqParse_t *parseData);
-static ssize_t handleResponse(int sockToServ, int sockToClient, char *req, cacheStorage_t *cacheStorage, int *status);
+static ssize_t handleResponse(int sockToServ, int sockToClient, cacheEntry_t *cacheEntry, int *status);
 
-void handleClient(void *args) { // полностью работаем с клиентом - получаем запрос, отправляем ответ
+void clientHandlerInit() {
+    pthread_mutex_init(&searchCreateMutex, NULL);
+}
+
+void clientHandlerFinalize() {
+    pthread_mutex_destroy(&searchCreateMutex);
+}
+
+void handleClient(void *args) {
     int sockToClient = ((clientHandlerArgs_t*) args)->sockToClient;
     cacheStorage_t *cacheStorage = ((clientHandlerArgs_t*) args)->cache;
     free(args);
@@ -37,10 +47,10 @@ void handleClient(void *args) { // полностью работаем с кли
     char request[MAX_REQ_SIZE + 1] = {0};
     cacheEntry_t *cacheEntry = NULL;
     ssize_t reqLen, respLen;
-    reqParse_t reqParse; 
+    reqParse_t reqParse;
     int err;
 
-    err = setTimeout(sockToClient, TIMEOUT); // таймаут на ожидание ответа от клиента
+    err = setTimeout(sockToClient, TIMEOUT);
     if (err) {
         loggerError("Failed to set timeout for client, error: %s", strerror(errno));
         disconnect(sockToClient);
@@ -63,9 +73,13 @@ void handleClient(void *args) { // полностью работаем с кли
         return;
     }
 
+    pthread_mutex_lock(&searchCreateMutex);
+
     /* Поиск записи в кэше и отправка */
     cacheEntry = cacheStorageGet(cacheStorage, path);
     if (cacheEntry) {
+        pthread_mutex_unlock(&searchCreateMutex);
+
         loggerDebug("Found cache entry for resource %s", path);
 
         err = sendFromCache(sockToClient, cacheEntry);
@@ -81,10 +95,30 @@ void handleClient(void *args) { // полностью работаем с кли
     /* Запись не найдена, обращаемся к серверу */
     loggerDebug("Cache entry for resource %s not found", path);
 
+    cacheEntry = cacheEntryCreate();
+    if (!cacheEntry) {
+        pthread_mutex_unlock(&searchCreateMutex);
+        loggerError("Failed to create cache entry");
+        disconnect(sockToClient);
+        return;
+    }
+
+    err = cacheStoragePut(cacheStorage, path, cacheEntry);
+    pthread_mutex_unlock(&searchCreateMutex);
+    if (err) {
+        loggerError("Failed to add entry for resource %s", path);
+        cacheEntryDereference(cacheEntry);
+        disconnect(sockToClient);
+        return;
+    }
+
     /* Определяем доменное имя сервера */
     phrHeader_t *hostHeader = findHeader(reqParse.headers, reqParse.numHeaders, "Host");
     if (!hostHeader) {
         loggerError("Failed to fetch host name");
+        cacheEntrySetCanceled(cacheEntry);
+        cacheStorageRemove(cacheStorage, path);
+        cacheEntryDereference(cacheEntry);
         disconnect(sockToClient);
         return;
     }
@@ -95,6 +129,9 @@ void handleClient(void *args) { // полностью работаем с кли
     sockToServ = connectToServ(hostName);
     if (sockToServ < 0) {
         loggerError("Failed to connect to %s", hostName);
+        cacheEntrySetCanceled(cacheEntry);
+        cacheStorageRemove(cacheStorage, path);
+        cacheEntryDereference(cacheEntry);
         disconnect(sockToClient);
         return;
     }
@@ -103,6 +140,9 @@ void handleClient(void *args) { // полностью работаем с кли
     err = sendData(sockToServ, request, reqLen);
     if (err) {
         loggerError("Failed to send request to server, error: %s", strerror(errno));
+        cacheEntrySetCanceled(cacheEntry);
+        cacheStorageRemove(cacheStorage, path);
+        cacheEntryDereference(cacheEntry);
         disconnect(sockToClient);
         disconnect(sockToServ);
         return;
@@ -110,20 +150,25 @@ void handleClient(void *args) { // полностью работаем с кли
     loggerDebug("Sent request of %ld bytes to server %s", reqLen, hostName);
 
     int status;
-    respLen = handleResponse(sockToServ, sockToClient, path, cacheStorage, &status);
-    if (respLen < 0) {
-        loggerError("Error handling response");
-        disconnect(sockToClient);
-        disconnect(sockToServ);
-        return;
-    }
-    loggerInfo("Server %s responded with %ld bytes, status: %d", hostName, respLen, status);
-
+    respLen = handleResponse(sockToServ, sockToClient, cacheEntry, &status);
     disconnect(sockToClient);
     disconnect(sockToServ);
+
+    if (respLen < 0) {
+        loggerError("Error handling response");
+        cacheEntrySetCanceled(cacheEntry);
+        cacheStorageRemove(cacheStorage, path);
+        cacheEntryDereference(cacheEntry);
+        return;
+    }
+
+    loggerInfo("Server %s responded with %ld bytes, status: %d", hostName, respLen, status);
+    if (status != 200) {
+        cacheEntrySetCanceled(cacheEntry);
+        cacheStorageRemove(cacheStorage, path);
+    }
+    cacheEntryDereference(cacheEntry);
 }
-
-
 
 static int strEq(const char *s1, const char *s2, size_t len) {
     return strncmp(s1, s2, len) == 0;
@@ -183,8 +228,6 @@ static int connectToServ(const char *hostName) {
     return sockToServ;
 }
 
-
-
 static phrHeader_t *findHeader(phrHeader_t headers[], size_t numHeaders, const char *name) {
     size_t len = strlen(name);
     for (size_t i = 0; i < numHeaders; i++) {
@@ -208,8 +251,6 @@ static size_t getContentLen(phrHeader_t headers[], size_t numHeaders) {
     return contLen;
 }
 
-
-
 static int sendData(int sock, const char *data, size_t len) {
     ssize_t sentTotal = 0;
     ssize_t sent;
@@ -227,10 +268,10 @@ static int sendFromCache(int sock, cacheEntry_t *cache) {
     size_t lenToSend;
     int err, ret;
 
-    pthread_mutex_lock(&cache->mutex); // чтобы не было race condition за запись в кэше, 1 читает, 1 пишет
+    pthread_mutex_lock(&cache->mutex);
 
     while (1) {
-        while (cache->size == sentTotal && !cache->completed && !cache->canceled) { // делаем wait до момента, пока не придут/не обновятся данные
+        while (cache->size == sentTotal && !cache->completed && !cache->canceled) {
             pthread_cond_wait(&cache->updated, &cache->mutex);
         }
 
@@ -306,10 +347,9 @@ static ssize_t readAndParseRequest(int sock, char *buf, size_t maxLen, reqParse_
     return buflen;
 }
 
-static ssize_t handleResponse(int sockToServ, int sockToClient, char *req, cacheStorage_t *cacheStorage, int *status) {
+static ssize_t handleResponse(int sockToServ, int sockToClient, cacheEntry_t *cacheEntry, int *status) {
     char buf[READ_BUF_LEN + 1];
     respParse_t parse;
-    cacheEntry_t *newCache = NULL;
     ssize_t recvd;
     size_t recvdTotal = 0, headerLen, contentLen;
     char *headerEnd;
@@ -323,12 +363,9 @@ static ssize_t handleResponse(int sockToServ, int sockToClient, char *req, cache
         }
 
         recvd = read(sockToServ, buf + recvdTotal, READ_BUF_LEN - recvdTotal);
-        if (recvd == -1) {
-            loggerError("Receive error: %s", strerror(errno));
-            return -1;
-        }
-        if (recvd == 0) {
-            loggerError("Receive error: server disconnected");
+        if (recvd <= 0) {
+            if (recvd == -1) loggerError("Receive error: %s", strerror(errno));
+            if (recvd == 0) loggerError("Receive error: server disconnected");
             return -1;
         }
 
@@ -359,28 +396,16 @@ static ssize_t handleResponse(int sockToServ, int sockToClient, char *req, cache
         return -1;
     }
 
-    /* Если ответ успешный, создаем для него кэш-запись */
-    if (parse.status == 200) {
-        newCache = cacheEntryCreate();
-        if (!newCache) {
-            loggerError("Failed to create new cache entry");
-        }
+    /* Если ответ неуспешный, его не надо сохранять */
+    if (parse.status != 200) {
+        cacheEntry = NULL;
     }
 
     /* Добавляем в запись все данные, полученные на текущий момент */
-    err = cacheEntryAppend(newCache, buf, recvdTotal);
+    err = cacheEntryAppend(cacheEntry, buf, recvdTotal);
     if (err) {
         loggerError("Failed to append data to cache entry");
-        cacheEntryDestroy(newCache);
-        newCache = NULL;
-    }
-
-    /* Сразу добавляем запись в хранилище */
-    err = cacheStoragePut(cacheStorage, req, newCache);
-    if (err) {
-        loggerError("Failed to add cache entry to storage");
-        cacheEntryDestroy(newCache);
-        newCache = NULL;
+        return -1;
     }
 
     /* Получаем оставшиеся данные от сервера, пересылаем клиенту и сохраняем в кэш */
@@ -390,8 +415,6 @@ static ssize_t handleResponse(int sockToServ, int sockToClient, char *req, cache
         if (recvd <= 0) {
             if (recvd == -1) loggerError("Receive error: %s", strerror(errno));
             if (recvd == 0) loggerError("Receive error: server disconnected");
-            cacheEntrySetCanceled(newCache);
-            cacheStorageRemove(cacheStorage, req);
             return -1;
         }
 
@@ -401,21 +424,16 @@ static ssize_t handleResponse(int sockToServ, int sockToClient, char *req, cache
         err = sendData(sockToClient, buf, recvd);
         if (err) {
             loggerError("Failed to send data back to client");
-            cacheEntrySetCanceled(newCache);
-            cacheStorageRemove(cacheStorage, req);
             return -1;
         }
 
-        err = cacheEntryAppend(newCache, buf, recvd);
+        err = cacheEntryAppend(cacheEntry, buf, recvd);
         if (err) {
             loggerError("Failed to append data to cache entry");
-            cacheEntrySetCanceled(newCache);
-            cacheStorageRemove(cacheStorage, req);
-            newCache = NULL;
+            return -1;
         }
     }
 
-    cacheEntrySetCompleted(newCache);
-    loggerDebug("Cached response to %s", req);
+    cacheEntrySetCompleted(cacheEntry);
     return recvdTotal;
 }
