@@ -26,7 +26,7 @@ static int sendData(int sock, const char *data, size_t len);
 static int sendFromCache(int sock, cacheEntry_t *cache);
 
 static ssize_t readAndParseRequest(int sock, char *buf, size_t maxLen, reqParse_t *parseData);
-static ssize_t handleResponse(int sockToServ, int sockToClient, cacheEntry_t *cacheEntry, int *status);
+static void *handleResponse(void *arg);
 
 void handleClient(void *args) {
     int sockToClient = ((clientHandlerArgs_t*) args)->sockToClient;
@@ -140,24 +140,48 @@ void handleClient(void *args) {
     loggerDebug("Sent request of %ld bytes to server %s", reqLen, hostName);
 
     int status;
-    respLen = handleResponse(sockToServ, sockToClient, cacheEntry, &status);
-    disconnect(sockToClient);
-    disconnect(sockToServ);
-
-    if (respLen < 0) {
-        loggerError("Error handling response");
+    receiverArgs_t *receiverArgs = malloc(sizeof(*receiverArgs));
+    if (!receiverArgs) {
+        loggerError("Failed to allocate memory for receiver arguments");
         cacheEntrySetCanceled(cacheEntry);
         cacheStorageRemove(cacheStorage, path);
         cacheEntryDereference(cacheEntry);
+        disconnect(sockToClient);
+        disconnect(sockToServ);
         return;
     }
 
-    loggerInfo("Server %s responded with %ld bytes, status: %d", hostName, respLen, status);
-    if (status != 200) {
-        cacheEntrySetCanceled(cacheEntry);
+    receiverArgs->sockToServ = sockToServ;
+    receiverArgs->cacheEntry = cacheEntry;
+    receiverArgs->status = &status;
+    receiverArgs->respLen = &respLen;
+
+    /* Receiver thread получает новую ссылку */
+    cacheEntryReference(cacheEntry);
+
+    pthread_t receiverThread;
+    pthread_create(&receiverThread, NULL, handleResponse, receiverArgs);
+
+    err = sendFromCache(sockToClient, cacheEntry);
+    cacheEntryDereference(cacheEntry);  // удаляем ссылку, используемую для пересылки клиенту
+    disconnect(sockToClient);
+    if (err) {
+        loggerError("Failed to send response to client");
+    }
+
+    pthread_join(receiverThread, NULL);
+    cacheEntryDereference(cacheEntry);  // удаляем ссылку receiver thread'а
+    disconnect(sockToServ);
+
+    if (respLen < 0 || status != 200) {
         cacheStorageRemove(cacheStorage, path);
     }
-    cacheEntryDereference(cacheEntry);
+
+    if (respLen < 0) {
+        loggerError("Failed to receive response");
+    } else {
+        loggerInfo("Server %s responded with %ld bytes, status: %d", hostName, respLen, status);
+    }
 }
 
 static int strEq(const char *s1, const char *s2, size_t len) {
@@ -337,7 +361,13 @@ static ssize_t readAndParseRequest(int sock, char *buf, size_t maxLen, reqParse_
     return buflen;
 }
 
-static ssize_t handleResponse(int sockToServ, int sockToClient, cacheEntry_t *cacheEntry, int *status) {
+static void *handleResponse(void *arg) {
+    int sockToServ = ((receiverArgs_t*) arg)->sockToServ;
+    cacheEntry_t *cacheEntry = ((receiverArgs_t*) arg)->cacheEntry;
+    int *status = ((receiverArgs_t*) arg)->status;
+    ssize_t *respLen = ((receiverArgs_t*) arg)->respLen;
+    free(arg);
+
     char buf[READ_BUF_LEN + 1];
     respParse_t parse;
     ssize_t recvd;
@@ -349,14 +379,18 @@ static ssize_t handleResponse(int sockToServ, int sockToClient, cacheEntry_t *ca
     do {
         if (recvdTotal == READ_BUF_LEN) {
             loggerError("Receive error: headers section is too long");
-            return -1;
+            cacheEntrySetCanceled(cacheEntry);
+            *respLen = -1;
+            return NULL;
         }
 
         recvd = read(sockToServ, buf + recvdTotal, READ_BUF_LEN - recvdTotal);
         if (recvd <= 0) {
             if (recvd == -1) loggerError("Receive error: %s", strerror(errno));
             if (recvd == 0) loggerError("Receive error: server disconnected");
-            return -1;
+            cacheEntrySetCanceled(cacheEntry);
+            *respLen = -1;
+            return NULL;
         }
 
         recvdTotal += recvd;
@@ -373,57 +407,48 @@ static ssize_t handleResponse(int sockToServ, int sockToClient, cacheEntry_t *ca
     );
     if (err < 0) {
         loggerError("Failed to parse response, error: %i", err);
-        return -1;
+        cacheEntrySetCanceled(cacheEntry);
+        *respLen = -1;
+        return NULL;
     }
     *status = parse.status;
 
     contentLen = getContentLen(parse.headers, parse.numHeaders);
 
-    /* Отправляем клиенту все данные, полученные на текущий момент */
-    err = sendData(sockToClient, buf, recvdTotal);
-    if (err) {
-        loggerError("Failed to send data back to client");
-        return -1;
-    }
-
-    /* Если ответ неуспешный, его не надо сохранять */
-    if (parse.status != 200) {
-        cacheEntry = NULL;
-    }
-
     /* Добавляем в запись все данные, полученные на текущий момент */
     err = cacheEntryAppend(cacheEntry, buf, recvdTotal);
     if (err) {
         loggerError("Failed to append data to cache entry");
-        return -1;
+        cacheEntrySetCanceled(cacheEntry);
+        *respLen = -1;
+        return NULL;
     }
 
-    /* Получаем оставшиеся данные от сервера, пересылаем клиенту и сохраняем в кэш */
+    /* Получаем оставшиеся данные от сервера и сохраняем в кэш */
     ssize_t remaining = headerLen + contentLen - recvdTotal;
     while (remaining > 0) {
         recvd = read(sockToServ, buf, READ_BUF_LEN);
         if (recvd <= 0) {
             if (recvd == -1) loggerError("Receive error: %s", strerror(errno));
             if (recvd == 0) loggerError("Receive error: server disconnected");
-            return -1;
+            cacheEntrySetCanceled(cacheEntry);
+            *respLen = -1;
+            return NULL;
         }
 
         remaining -= recvd;
         recvdTotal += recvd;
 
-        err = sendData(sockToClient, buf, recvd);
-        if (err) {
-            loggerError("Failed to send data back to client");
-            return -1;
-        }
-
         err = cacheEntryAppend(cacheEntry, buf, recvd);
         if (err) {
             loggerError("Failed to append data to cache entry");
-            return -1;
+            cacheEntrySetCanceled(cacheEntry);
+            *respLen = -1;
+            return NULL;
         }
     }
 
     cacheEntrySetCompleted(cacheEntry);
-    return recvdTotal;
+    *respLen = recvdTotal;
+    return NULL;
 }

@@ -35,6 +35,13 @@ typedef struct {
     cacheStorage_t *cache;
 } clientHandlerArgs_t;
 
+typedef struct {
+    int sockToServ;
+    cacheEntry_t *cacheEntry;
+    int *status;
+    ssize_t *respLen;
+} receiverArgs_t;
+
 void handleClient(void *args);
 
 #endif
