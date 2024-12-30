@@ -65,7 +65,6 @@ void proxyDestroy(proxy_t *proxy) {
     close(proxy->servSocket);
     proxy->running = 0;
     free(proxy);
-    clientHandlerFinalize();
 }
 
 int proxyStart(proxy_t *proxy) {
@@ -97,6 +96,5 @@ int proxyStart(proxy_t *proxy) {
         threadPoolSubmit(proxy->threadpool, handleClient, args);
     }
 
-    clientHandlerInit();
     return 0;
 }

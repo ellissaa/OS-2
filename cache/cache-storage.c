@@ -62,8 +62,6 @@ void cacheStorageDestroy(cacheStorage_t *storage) {
 int cacheStoragePut(cacheStorage_t *storage, char *req, cacheEntry_t *resp) {
     if (!storage || !req || !resp) return 0;
 
-    pthread_mutex_lock(&storage->mutex);
-
     size_t reqLen = strlen(req);
     unsigned long index = hash(req, reqLen); // переданную строку преобразовали в индекс, по которому в дальнейшем будем обращаться
     node_t *current = storage->map[index];
@@ -78,7 +76,6 @@ int cacheStoragePut(cacheStorage_t *storage, char *req, cacheEntry_t *resp) {
                 loggerDebug("cacheStoragePut: modified node, key '%s'", req);
             }
 
-            pthread_mutex_unlock(&storage->mutex);
             return 0;
         }
         current = current->next;
@@ -90,7 +87,6 @@ int cacheStoragePut(cacheStorage_t *storage, char *req, cacheEntry_t *resp) {
     if (!newNode || !request) {
         free(newNode);
         free(request);
-        pthread_mutex_unlock(&storage->mutex);
         return -1;
     }
 
@@ -105,15 +101,12 @@ int cacheStoragePut(cacheStorage_t *storage, char *req, cacheEntry_t *resp) {
     storage->map[index] = newNode;
 
     loggerDebug("cacheStoragePut: created new node, key '%s'", req);
-    pthread_mutex_unlock(&storage->mutex);
     return 0;
 }
 
 /* возвращаем запись по данному запросу */
 cacheEntry_t *cacheStorageGet(cacheStorage_t *storage, char *req) { 
     if (!storage || !req) return NULL;
-
-    pthread_mutex_lock(&storage->mutex);
 
     size_t reqLen = strlen(req);
     unsigned long index = hash(req, reqLen);
@@ -129,7 +122,6 @@ cacheEntry_t *cacheStorageGet(cacheStorage_t *storage, char *req) {
         current = current->next; // для поиска нужной ноды по заданному хэшу
     }
 
-    pthread_mutex_unlock(&storage->mutex);
     return NULL;
 }
 
