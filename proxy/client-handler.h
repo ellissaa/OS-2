@@ -38,8 +38,8 @@ typedef struct {
 typedef struct {
     int sockToServ;
     cacheEntry_t *cacheEntry;
-    int *status;
-    ssize_t *respLen;
+    cacheStorage_t *cacheStorage;
+    char *path;
 } receiverArgs_t;
 
 void handleClient(void *args);

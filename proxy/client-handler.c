@@ -28,15 +28,22 @@ static int sendFromCache(int sock, cacheEntry_t *cache);
 static ssize_t readAndParseRequest(int sock, char *buf, size_t maxLen, reqParse_t *parseData);
 static void *handleResponse(void *arg);
 
+#define CLEANUP(cacheEntry, cacheStorage, path, sockToClient, sockToServ)                           \
+    cacheEntrySetCanceled(cacheEntry);                                                              \
+    cacheStorageRemove(cacheStorage, path);                                                         \
+    cacheEntryDereference(cacheEntry);                                                              \
+    disconnect(sockToClient);                                                                       \
+    disconnect(sockToServ)
+
 void handleClient(void *args) {
     int sockToClient = ((clientHandlerArgs_t*) args)->sockToClient;
     cacheStorage_t *cacheStorage = ((clientHandlerArgs_t*) args)->cache;
     free(args);
 
-    int sockToServ;
+    int sockToServ = -1;
     char request[MAX_REQ_SIZE + 1] = {0};
     cacheEntry_t *cacheEntry = NULL;
-    ssize_t reqLen, respLen;
+    ssize_t reqLen;
     reqParse_t reqParse;
     int err;
 
@@ -67,120 +74,82 @@ void handleClient(void *args) {
 
     /* Поиск записи в кэше и отправка */
     cacheEntry = cacheStorageGet(cacheStorage, path);
-    if (cacheEntry) {
-        pthread_mutex_unlock(&cacheStorage->mutex);
-
-        loggerDebug("Found cache entry for resource %s", path);
-
-        err = sendFromCache(sockToClient, cacheEntry);
-        cacheEntryDereference(cacheEntry);
-        disconnect(sockToClient);
-
-        if (err) {
-            loggerError("Failed to send response to client");
-        }
-        return;
-    }
-
-    /* Запись не найдена, обращаемся к серверу */
-    loggerDebug("Cache entry for resource %s not found", path);
-
-    cacheEntry = cacheEntryCreate();
     if (!cacheEntry) {
+        loggerDebug("Cache entry for resource %s not found", path);
+
+        cacheEntry = cacheEntryCreate();
+        err = cacheStoragePut(cacheStorage, path, cacheEntry);
         pthread_mutex_unlock(&cacheStorage->mutex);
-        loggerError("Failed to create cache entry");
-        disconnect(sockToClient);
-        return;
+
+        if (!cacheEntry || err) {
+            if (!cacheEntry) loggerError("Failed to create cache entry");
+            if (err) loggerError("Failed to add entry for resource %s", path);
+            CLEANUP(cacheEntry, NULL, NULL, sockToClient, sockToServ);
+            return;
+        }
+
+        /* Определяем доменное имя сервера */
+        phrHeader_t *hostHeader = findHeader(reqParse.headers, reqParse.numHeaders, "Host");
+        if (!hostHeader) {
+            loggerError("Failed to fetch host name");
+            CLEANUP(cacheEntry, cacheStorage, path, sockToClient, sockToServ);
+            return;
+        }
+        char hostName[hostHeader->value_len + 1];
+        memcpy(hostName, hostHeader->value, hostHeader->value_len);
+        hostName[hostHeader->value_len] = 0;
+
+        sockToServ = connectToServ(hostName);
+        if (sockToServ < 0) {
+            loggerError("Failed to connect to %s", hostName);
+            CLEANUP(cacheEntry, cacheStorage, path, sockToClient, sockToServ);
+            return;
+        }
+        loggerInfo("Connected to server %s", hostName);
+
+        err = sendData(sockToServ, request, reqLen);
+        if (err) {
+            loggerError("Failed to send request to server, error: %s", strerror(errno));
+            CLEANUP(cacheEntry, cacheStorage, path, sockToClient, sockToServ);
+            return;
+        }
+        loggerDebug("Sent request of %ld bytes to server %s", reqLen, hostName);
+
+        receiverArgs_t *receiverArgs = malloc(sizeof(*receiverArgs));
+        char *path1 = malloc(reqParse.pathLen + 1);
+        if (!receiverArgs || !path1) {
+            loggerError("Failed to allocate memory for receiver arguments");
+            CLEANUP(cacheEntry, cacheStorage, path, sockToClient, sockToServ);
+            free(receiverArgs);
+            free(path1);
+            return;
+        }
+
+        memcpy(path1, path, reqParse.pathLen + 1);
+        receiverArgs->sockToServ = sockToServ;
+        receiverArgs->cacheEntry = cacheEntry;
+        receiverArgs->cacheStorage = cacheStorage;
+        receiverArgs->path = path1;
+
+        /* Receiver thread получает новую ссылку */
+        cacheEntryReference(cacheEntry);
+
+        pthread_attr_t attr;
+        pthread_t receiverThread;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_create(&receiverThread, &attr, handleResponse, receiverArgs);
+        pthread_attr_destroy(&attr);
+    } else {
+        pthread_mutex_unlock(&cacheStorage->mutex);
+        loggerDebug("Found cache entry for resource %s", path);
     }
-
-    err = cacheStoragePut(cacheStorage, path, cacheEntry);
-    pthread_mutex_unlock(&cacheStorage->mutex);
-    if (err) {
-        loggerError("Failed to add entry for resource %s", path);
-        cacheEntryDereference(cacheEntry);
-        disconnect(sockToClient);
-        return;
-    }
-
-    /* Определяем доменное имя сервера */
-    phrHeader_t *hostHeader = findHeader(reqParse.headers, reqParse.numHeaders, "Host");
-    if (!hostHeader) {
-        loggerError("Failed to fetch host name");
-        cacheEntrySetCanceled(cacheEntry);
-        cacheStorageRemove(cacheStorage, path);
-        cacheEntryDereference(cacheEntry);
-        disconnect(sockToClient);
-        return;
-    }
-    char hostName[hostHeader->value_len + 1];
-    memcpy(hostName, hostHeader->value, hostHeader->value_len);
-    hostName[hostHeader->value_len] = 0;
-
-    sockToServ = connectToServ(hostName);
-    if (sockToServ < 0) {
-        loggerError("Failed to connect to %s", hostName);
-        cacheEntrySetCanceled(cacheEntry);
-        cacheStorageRemove(cacheStorage, path);
-        cacheEntryDereference(cacheEntry);
-        disconnect(sockToClient);
-        return;
-    }
-    loggerInfo("Connected to server %s", hostName);
-
-    err = sendData(sockToServ, request, reqLen);
-    if (err) {
-        loggerError("Failed to send request to server, error: %s", strerror(errno));
-        cacheEntrySetCanceled(cacheEntry);
-        cacheStorageRemove(cacheStorage, path);
-        cacheEntryDereference(cacheEntry);
-        disconnect(sockToClient);
-        disconnect(sockToServ);
-        return;
-    }
-    loggerDebug("Sent request of %ld bytes to server %s", reqLen, hostName);
-
-    int status;
-    receiverArgs_t *receiverArgs = malloc(sizeof(*receiverArgs));
-    if (!receiverArgs) {
-        loggerError("Failed to allocate memory for receiver arguments");
-        cacheEntrySetCanceled(cacheEntry);
-        cacheStorageRemove(cacheStorage, path);
-        cacheEntryDereference(cacheEntry);
-        disconnect(sockToClient);
-        disconnect(sockToServ);
-        return;
-    }
-
-    receiverArgs->sockToServ = sockToServ;
-    receiverArgs->cacheEntry = cacheEntry;
-    receiverArgs->status = &status;
-    receiverArgs->respLen = &respLen;
-
-    /* Receiver thread получает новую ссылку */
-    cacheEntryReference(cacheEntry);
-
-    pthread_t receiverThread;
-    pthread_create(&receiverThread, NULL, handleResponse, receiverArgs);
 
     err = sendFromCache(sockToClient, cacheEntry);
-    cacheEntryDereference(cacheEntry);  // удаляем ссылку, используемую для пересылки клиенту
+    cacheEntryDereference(cacheEntry); // удаляем ссылку, используемую для пересылки клиенту
     disconnect(sockToClient);
     if (err) {
         loggerError("Failed to send response to client");
-    }
-
-    pthread_join(receiverThread, NULL);
-    cacheEntryDereference(cacheEntry);  // удаляем ссылку receiver thread'а
-    disconnect(sockToServ);
-
-    if (respLen < 0 || status != 200) {
-        cacheStorageRemove(cacheStorage, path);
-    }
-
-    if (respLen < 0) {
-        loggerError("Failed to receive response");
-    } else {
-        loggerInfo("Server %s responded with %ld bytes, status: %d", hostName, respLen, status);
     }
 }
 
@@ -364,8 +333,8 @@ static ssize_t readAndParseRequest(int sock, char *buf, size_t maxLen, reqParse_
 static void *handleResponse(void *arg) {
     int sockToServ = ((receiverArgs_t*) arg)->sockToServ;
     cacheEntry_t *cacheEntry = ((receiverArgs_t*) arg)->cacheEntry;
-    int *status = ((receiverArgs_t*) arg)->status;
-    ssize_t *respLen = ((receiverArgs_t*) arg)->respLen;
+    cacheStorage_t *cacheStorage = ((receiverArgs_t*) arg)->cacheStorage;
+    char *path = ((receiverArgs_t*) arg)->path;
     free(arg);
 
     char buf[READ_BUF_LEN + 1];
@@ -379,8 +348,8 @@ static void *handleResponse(void *arg) {
     do {
         if (recvdTotal == READ_BUF_LEN) {
             loggerError("Receive error: headers section is too long");
-            cacheEntrySetCanceled(cacheEntry);
-            *respLen = -1;
+            CLEANUP(cacheEntry, cacheStorage, path, -1, sockToServ);
+            free(path);
             return NULL;
         }
 
@@ -388,8 +357,8 @@ static void *handleResponse(void *arg) {
         if (recvd <= 0) {
             if (recvd == -1) loggerError("Receive error: %s", strerror(errno));
             if (recvd == 0) loggerError("Receive error: server disconnected");
-            cacheEntrySetCanceled(cacheEntry);
-            *respLen = -1;
+            CLEANUP(cacheEntry, cacheStorage, path, -1, sockToServ);
+            free(path);
             return NULL;
         }
 
@@ -407,11 +376,15 @@ static void *handleResponse(void *arg) {
     );
     if (err < 0) {
         loggerError("Failed to parse response, error: %i", err);
-        cacheEntrySetCanceled(cacheEntry);
-        *respLen = -1;
+        CLEANUP(cacheEntry, cacheStorage, path, -1, sockToServ);
+        free(path);
         return NULL;
     }
-    *status = parse.status;
+
+    /* Сразу убираем из хранилища неуспешный ответ */
+    if (parse.status != 200) {
+        cacheStorageRemove(cacheStorage, path);
+    }
 
     contentLen = getContentLen(parse.headers, parse.numHeaders);
 
@@ -419,8 +392,8 @@ static void *handleResponse(void *arg) {
     err = cacheEntryAppend(cacheEntry, buf, recvdTotal);
     if (err) {
         loggerError("Failed to append data to cache entry");
-        cacheEntrySetCanceled(cacheEntry);
-        *respLen = -1;
+        CLEANUP(cacheEntry, cacheStorage, path, -1, sockToServ);
+        free(path);
         return NULL;
     }
 
@@ -431,8 +404,8 @@ static void *handleResponse(void *arg) {
         if (recvd <= 0) {
             if (recvd == -1) loggerError("Receive error: %s", strerror(errno));
             if (recvd == 0) loggerError("Receive error: server disconnected");
-            cacheEntrySetCanceled(cacheEntry);
-            *respLen = -1;
+            CLEANUP(cacheEntry, cacheStorage, path, -1, sockToServ);
+            free(path);
             return NULL;
         }
 
@@ -442,13 +415,17 @@ static void *handleResponse(void *arg) {
         err = cacheEntryAppend(cacheEntry, buf, recvd);
         if (err) {
             loggerError("Failed to append data to cache entry");
-            cacheEntrySetCanceled(cacheEntry);
-            *respLen = -1;
+            CLEANUP(cacheEntry, cacheStorage, path, -1, sockToServ);
+            free(path);
             return NULL;
         }
     }
 
+    loggerInfo("%s: responded with %ld bytes, status: %d", path, recvdTotal, parse.status);
+
     cacheEntrySetCompleted(cacheEntry);
-    *respLen = recvdTotal;
+    cacheEntryDereference(cacheEntry);
+    disconnect(sockToServ);
+    free(path);
     return NULL;
 }
